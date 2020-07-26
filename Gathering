@@ -1,0 +1,274 @@
+'''
+#########################################
+* Title: 树莓派实验
+* Name:  温湿度数据采集实验
+* Author: AJ
+#########################################
+'''
+import smbus
+import time
+import threading
+import RPi.GPIO as GPIO
+import tkinter as tk
+
+#定义GPIO引脚，连接两个数码管的时钟和数据输入口DIO
+SCLK = 4
+RCLK = 5
+DIO = 7
+SCLK2 = 17
+RCLK2 = 27
+DIO2 = 22
+LED_PINS = [4,5,7,17,27,22]
+GPIO.setmode(GPIO.BCM) #设置引脚编号为BCM编号方式
+for led_pin in LED_PINS: #将这些GPIO引脚设置为输出
+    GPIO.setup(led_pin,GPIO.OUT)
+LED_Library = [0xC0, 0xF9, 0xA4,0xB0,0x99,0x92,0x82,
+               0xF8,0x80,0x90,0x8C,0xBF,0xC6,0xA1,0x86,0x8E,0xbf] #定义字模
+LED_Library2 = [0x40,0x79,0x24,0x30,0x19,0x12,0x02,0x78,0x00,0x10] #定义带小数点的字模
+
+address = 0x76 #温湿度采集模块的I2C总线地址
+# 温度寄存器地址
+Temp_MSB = 0xfa 
+Temp_LSB = 0xfb
+Temp_XLSB = 0xfc
+
+# 湿度寄存器地址
+Hum_MSB = 0xfd
+Hum_LSB = 0xfe
+
+bus = smbus.SMBus(1) #在树莓派中，I2C设备位于I2C-1,所以此处的编号为1
+#初始化设备寄存器
+bus.write_byte_data(address,0xe0,0xb6)
+#配置传感器工作模式
+bus.write_byte(address,0xd0)
+bus.read_byte(address)
+bus.write_byte_data(address,0xf4,0xff)
+bus.write_byte_data(address,0xf5,0x00)
+#读取湿度计算的参数值，根据补偿参数表的寄存器地址和数据类型来获得
+dig_H1 = bus.read_byte_data(address,0xA1) 
+dig_H2 = bus.read_word_data(address,0xE1)
+dig_H3 = bus.read_word_data(address,0xE3)
+dig_H4 = (bus.read_byte_data(address,0xE4)<<4)|(0x0F & bus.read_byte_data(address,0xE5))
+dig_H5 = (bus.read_byte_data(address,0xE6)<<4)|(0x0F & (bus.read_byte_data(address,0xE5)>>4))
+dig_H6 = bus.read_byte_data(address,0xE7)
+
+#读取温度计算的参数值，根据补偿参数表的寄存器地址和数据类型来获得
+bus.write_byte(address,0x88)
+dig_T1_1 = bus.read_byte(address)
+bus.write_byte(address,0x89)
+dig_T1_2 = bus.read_byte(address)
+dig_T1 = (dig_T1_2<<8|dig_T1_1)
+bus.write_byte(address,0x8A)
+dig_T2_1 = bus.read_byte(address)
+bus.write_byte(address,0x8B)
+dig_T2_2 = bus.read_byte(address)
+dig_T2 = (dig_T2_2<<8|dig_T2_1)
+bus.write_byte(address,0x8C)
+dig_T3_1 = bus.read_byte(address)
+bus.write_byte(address,0x8D)
+dig_T3_2 = bus.read_byte(address)
+dig_T3 = (dig_T3_2<<8|dig_T3_1)
+S_Temp = S_Hum = 0
+
+
+'''
+* 函数名称：Show(i_data,area)
+* 功能：将i_data表示的数值，显示在相应的4位数码管做上。
+* 参数含义：
+        i_data：要显示在数码管上的数值
+        area: 有两个4位数码管，当area为1时，数值显示在第一个4位数码管上，为2时，显示在第2个上
+'''
+def Show(i_data,area):
+    #提取i_data数值的每一位上的值
+    while i_data > 10000:
+        i_data = i_data - 10000 #将数值限制在10000以下
+    if(i_data >= 1000):
+        i_show1 = i_data//1000 #提取千位的值，存在i_show1中
+        i_data = i_data - i_show1 * 1000  #减去千位
+    else:
+        i_show1 = 0
+    if(i_data >= 100):
+        i_show2 = i_data//100 #提取百位值，存在i_show2中
+        i_data -= 100 * i_show2 #减去百位
+    else:
+        i_show2 = 0
+    if(i_data >= 10):
+        i_show3 = i_data//10 #提取十位值，存在i_show3中
+        i_data -= 10*i_show3 #减去十位
+    else:
+        i_show3 = 0
+    i_show4 = i_data #提取个位值，存在i_show4中
+    LED4_Display(i_show1,0x08,area,0) #将千位值写入4位数码管模块的从左往右的第一位，且不要小数点
+    LED4_Display(i_show2,0x04,area,1) #将百位值写入4位数码管模块的从左往右的第二位，要小数点
+    LED4_Display(i_show3,0x02,area,0) #将十位值写入4位数码管模块的从左往右的第三位，且不要小数点
+    LED4_Display(i_show4,0x01,area,0) #将个位值写入4位数码管模块的从左往右的第四位，且不要小数点
+
+'''
+* 函数名称：LED4_Display(i_index,hx_location,area,p)
+* 功能：将i_index数字对应的数模，输入到相应4位数码管的hx_location个位置上显示出来。
+        并且可以确定，该位数字是否需要小数点。
+* 参数含义：
+        i_index：在该位要显示的数字
+        hx_location: 表示4位数码管的某一位
+        area: 有两个4位数码管，当area为1时，数值显示在第一个4位数码管上，为2时，显示在第2个上
+        p: p为1时，表示该位需要小数点，否则不需要
+'''
+def LED4_Display(i_index,hx_location,area,p):
+    if p==1:#需要小数点，因此从第二个字模集合中读取字模
+        LED_OUT(LED_Library2[i_index],area)#将要显示的字模型，输入到指定的4位数码管上
+    else:#不需要小数点，因此从第一个字模集合中读取字模
+        LED_OUT(LED_Library[i_index],area)
+    LED_OUT(hx_location,area) #将位地址，输入到指定的4位数码管上
+    if area == 1: #第一个4位数码管模块
+        GPIO.output(RCLK,GPIO.LOW)  #字模和地址都通过DIO接口输出后，第一个4位数码管的接收时钟RCLK发出一个跳变信号，表示输出完成
+        GPIO.output(RCLK,GPIO.HIGH)
+    elif area == 2: #第二个4位数码管模块
+        #字模和地址都通过DIO接口输出后，第二个4位数码管的接收时钟RCLK2发出一个跳变信号，表示输出完成
+        GPIO.output(RCLK2,GPIO.LOW)
+        GPIO.output(RCLK2,GPIO.HIGH) #即先低电平，再高电平
+
+
+'''
+* 函数名称：LED_OUT(X,area)
+* 功能：将数据X输入到指定的4位数码管模块上
+* 参数含义：
+        X: 一个字节的数据X，可以是字模数据，也可以是地址数据
+        area: 有两个4位数码管，当area为1时，数值显示在第一个4位数码管上，为2时，显示在第2个上
+''' 
+def LED_OUT(X,area):
+    if area == 1: #输入到第一个4位数码管模块
+        for i in range(0,8): #一个字节是八位，循环8次将每一位数据通过DIO口输出到显示模块
+            if(X&0x80): #如果X最高位是1
+                GPIO.output(DIO,GPIO.HIGH) #则给高电平信号
+            else:
+                GPIO.output(DIO,GPIO.LOW) #低电平
+            GPIO.output(SCLK,GPIO.LOW)
+            GPIO.output(SCLK,GPIO.HIGH)
+            #每一位数据输出后，都要给串行时钟一个跳变信号，（先低电平，后高电平）
+            X<<=1 #X数据向左移一位，即准备读取下一位的数据
+    elif area == 2:  #输入到第二个4位数码管模块
+        for i in range(0,8):
+            if(X&0x80):
+                GPIO.output(DIO2,GPIO.HIGH)
+            else:
+                GPIO.output(DIO2,GPIO.LOW)
+            GPIO.output(SCLK2,GPIO.LOW)
+            GPIO.output(SCLK2,GPIO.HIGH)
+            X<<=1
+
+'''
+* 函数名称：show_thread()
+* 功能：在两个4位数码管模块显示温度值和湿度值
+* 参数含义：
+''' 
+def show_thread():
+    global S_Temp,S_Hum
+    while True:
+        Show(S_Temp,1)  #在第一个4位数码管模块显示温度值
+        Show(S_Hum,2)  #在第二个4位数码管模块显示湿度值
+
+#分别是显示温度值、湿度值
+global text1,text2,windows
+
+'''
+* 函数名称：refreshText():
+* 功能：用于更新窗口中得各个信号值文本，每秒更新一次
+* 参数含义：
+''' 
+def refreshText():
+    global text1,text2,text3,windows
+     #更新温度值
+    text1.delete(0.0,tk.END) #清除温度值文本内容
+    text1.insert(tk.INSERT,S_Temp/100) #添加最新温度值
+    text1.update()  #刷新文本组件
+
+    #更新湿度值
+    text2.delete(0.0,tk.END)
+    text2.insert(tk.INSERT,S_Hum/100)
+    text2.update()
+     #调用after函数，实现循环调用，起到定时更新得功能，1000毫秒更新一次
+    windows.after(1000,refreshText)
+
+'''
+* 函数名称：tk_thread():
+* 功能：窗口显示线程，用于绘制和显示窗口，以及更新窗口中得数值
+* 参数含义：
+''' 
+def tk_thread():
+    global text1,text2,text3,windows
+    windows = tk.Tk()
+    windows.geometry('500x500')  # 规定窗口大小500*500像素
+    windows.resizable(False, False)  # 规定窗口不可缩放
+    lab1 = tk.Label(windows, text='  ___Current Temperature(C)：', height=1, width=15, fg='black')
+    lab1.grid(row=0, column=0, ipadx=5, ipady=5) #将组件放到第0行第0列，间距单位5
+    text1 = tk.Text(windows,width=15,height=1) #创建text组件
+    text1.grid(row=0,column=1,padx=10,pady=10) #将组件放到第0行第1列，间距单位10
+
+    lab2 = tk.Label(windows, text='  ___Current Humidity(%)：', height=1, width=15, fg='black')
+    lab2.grid(row=1, column=0, ipadx=5, ipady=5) #将组件放到第1行第0列，间距单位5
+    text2 = tk.Text(windows,width=15,height=1) #创建text组件
+    text2.grid(row=1,column=1,padx=10,pady=10) #将组件放到第1行第1列，间距单位10
+    
+    windows.after(1000,refreshText) #循环更新文本框中的温度值和湿度值
+    windows.mainloop() #窗口循环显示
+
+'''
+* 函数名称：TH_thread():
+* 功能：温湿度采集线程
+* 参数含义：
+''' 
+def TH_thread():
+    global S_Temp,S_Hum #温度和湿度的值，全局变量用于在不同线程中传播
+    while True:
+        time.sleep(1) #采集速率为1秒采集一次
+        #读取计算温度需要的相关寄存器中的数值
+        bus.write_byte(address,Temp_MSB)
+        T_value1 = bus.read_byte(address)
+        bus.write_byte(address,Temp_LSB)
+        T_value2 = bus.read_byte(address)
+        bus.write_byte(address,Temp_XLSB)
+        T_value3 = bus.read_byte(address)
+        #温度转换公式，各项转换公式见datasheet
+        Temp = (T_value1<<16|T_value2<<8|T_value3)>>4
+        var1 = (Temp/16384 - dig_T1/1024)*dig_T2
+        var2 = ((Temp/131072 - dig_T1/8192) * (Temp/131072 - dig_T1/8192))*dig_T3
+        t_fine = (var1+var2)
+        Temp = (var1 + var2) / 5120.0
+        S_Temp = int(Temp*100) #用于在线程中分享
+        print("temp:",Temp)
+
+        #读取计算湿度需要的相关寄存器中的数值
+        bus.write_byte(address,Hum_MSB)
+        H_value1 = bus.read_byte(address)
+        bus.write_byte(address,Hum_LSB)
+        H_value2 = bus.read_byte(address)
+        Hum = (H_value1<<8|H_value2)
+        #湿度转换公式，各项转换公式见datasheet
+        H_var = ((t_fine) - 76800.0)
+        H_var = (Hum - ((dig_H4) * 64.0 + (dig_H5) / 16384.0 * H_var)) * ((dig_H2) / 65536.0 * (1.0 + (dig_H6) / 67108864.0 * H_var *  (1.0 + (dig_H3) / 67108864.0 * H_var)))
+        H_var = H_var * (1.0 - (dig_H1) * H_var / 524288.0)
+        Hum = H_var - 48
+        #湿度时百分比值，因此范围在0~100
+        if (Hum > 100.0):
+            Hum = 100.0
+        elif (Hum < 0.0):
+            Hum = 0.0
+        S_Hum = int(Hum * 100) #用于在线程中分享
+        print("Hum:",Hum)
+        print("================================")
+    
+
+if __name__ == "__main__":
+
+    thread1_read = threading.Thread(target = TH_thread,args = ()) #温湿度读取功能得线程
+    thread2_show = threading.Thread(target = show_thread,args = ()) #数据显示在数码管上得功能得线程
+    thread3_tk = threading.Thread(target = tk_thread,args = ()) #窗口绘制和显示，以及更新窗口数据功能得线程
+    print("开始采集和显示....")
+    thread1_read.start()
+    thread2_show.start()
+    thread3_tk.start()
+    #开启上面三个线程
+    thread1_read.join()
+    thread2_show.join()
+    thread3_tk.join()
+    #等待上面三个线程结束
